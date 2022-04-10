@@ -3,9 +3,10 @@ package drain
 import (
 	"context"
 	"fmt"
-	"sync"
+	"strings"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -28,6 +29,13 @@ import (
 // retryDelay is how long is slept before retry after an error occurs during drainage
 const retryDelay = 5 * time.Second
 
+var recoverablePodEvictionErrors = [...]string{
+	"Cannot evict pod as it would violate the pod's disruption budget",
+	"TooManyRequests",
+	"NotFound",
+	"not found",
+}
+
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -generate
 //counterfeiter:generate -o fakes/fake_evictor.go . Evictor
 type Evictor interface {
@@ -37,16 +45,17 @@ type Evictor interface {
 }
 
 type NodeGroupDrainer struct {
-	clientSet           kubernetes.Interface
-	evictor             Evictor
-	ng                  eks.KubeNodeGroup
-	waitTimeout         time.Duration
-	nodeDrainWaitPeriod time.Duration
-	undo                bool
-	parallel            int
+	clientSet             kubernetes.Interface
+	evictor               Evictor
+	ng                    eks.KubeNodeGroup
+	waitTimeout           time.Duration
+	nodeDrainWaitPeriod   time.Duration
+	podEvictionWaitPeriod time.Duration
+	undo                  bool
+	parallel              int
 }
 
-func NewNodeGroupDrainer(clientSet kubernetes.Interface, ng eks.KubeNodeGroup, waitTimeout, maxGracePeriod, nodeDrainWaitPeriod time.Duration, undo, disableEviction bool, parallel int) NodeGroupDrainer {
+func NewNodeGroupDrainer(clientSet kubernetes.Interface, ng eks.KubeNodeGroup, waitTimeout, maxGracePeriod, nodeDrainWaitPeriod time.Duration, podEvictionWaitPeriod time.Duration, undo, disableEviction bool, parallel int) NodeGroupDrainer {
 	ignoreDaemonSets := []metav1.ObjectMeta{
 		{
 			Namespace: "kube-system",
@@ -74,13 +83,14 @@ func NewNodeGroupDrainer(clientSet kubernetes.Interface, ng eks.KubeNodeGroup, w
 	}
 
 	return NodeGroupDrainer{
-		evictor:             evictor.New(clientSet, maxGracePeriod, ignoreDaemonSets, disableEviction),
-		clientSet:           clientSet,
-		ng:                  ng,
-		waitTimeout:         waitTimeout,
-		nodeDrainWaitPeriod: nodeDrainWaitPeriod,
-		undo:                undo,
-		parallel:            parallel,
+		evictor:               evictor.New(clientSet, maxGracePeriod, ignoreDaemonSets, disableEviction),
+		clientSet:             clientSet,
+		ng:                    ng,
+		waitTimeout:           waitTimeout,
+		nodeDrainWaitPeriod:   nodeDrainWaitPeriod,
+		podEvictionWaitPeriod: podEvictionWaitPeriod,
+		undo:                  undo,
+		parallel:              parallel,
 	}
 }
 
@@ -144,19 +154,23 @@ func (n *NodeGroupDrainer) Drain() error {
 
 			logger.Debug("already drained: %v", mapToList(drainedNodes.Items()))
 			logger.Debug("will drain: %v", newPendingNodes.List())
-			for i, node := range newPendingNodes.List() {
-				if err := sem.Acquire(ctx, 1); err != nil {
-					logger.Critical("failed to acquire semaphore: %w", err)
-				}
 
-				go func(i int, node string) {
+			errorGroup, _ := errgroup.WithContext(ctx)
+			for _, node := range newPendingNodes.List() {
+				node := node
+				errorGroup.Go(func() error {
+					if err := sem.Acquire(ctx, 1); err != nil {
+						return errors.Wrapf(err, "failed to acquire semaphore")
+					}
 					defer sem.Release(1)
+
+					drainedNodes.Set(node, nil)
 					logger.Debug("starting drain of node %s", node)
 					err := n.evictPods(ctx, node)
 					if err != nil {
 						logger.Warning("pod eviction error (%q) on node %s", err, node)
 						time.Sleep(retryDelay)
-						return
+						return nil
 					}
 
 					drainedNodes.Set(node, nil)
@@ -165,7 +179,11 @@ func (n *NodeGroupDrainer) Drain() error {
 						logger.Debug("waiting for %.0f seconds before draining next node", n.nodeDrainWaitPeriod.Seconds())
 						time.Sleep(n.nodeDrainWaitPeriod)
 					}
-				}(i, node)
+					return nil
+				})
+			}
+			if err := errorGroup.Wait(); err != nil {
+				return err
 			}
 		}
 	}
@@ -221,30 +239,35 @@ func (n *NodeGroupDrainer) evictPods(ctx context.Context, node string) error {
 				return nil
 			}
 			pods := list.Pods()
+			if len(pods) == 0 {
+				return nil
+			}
 			if w := list.Warnings(); w != "" {
 				logger.Warning(w)
 			}
 			// This log message is important but can be noisy.  It's useful to only
 			// update on a node every minute.
 			if time.Now().Sub(previousReportTime) > time.Minute*1 && len(pods) > 0 {
-				logger.Warning("%d pods are unevictable from node %s")
+				logger.Warning("%d pods are unevictable from node %s", len(pods), node)
 				previousReportTime = time.Now()
 			}
 			logger.Debug("%d pods to be evicted from %s", pods, node)
-			var wg sync.WaitGroup
+			errorGroup, _ := errgroup.WithContext(ctx)
 			for _, pod := range pods {
-				wg.Add(1)
-				go func(pod corev1.Pod) {
-					defer wg.Done()
-					// TODO: handle API rate limiter error
+				pod := pod
+				errorGroup.Go(func() error {
 					if err := n.evictor.EvictOrDeletePod(pod); err != nil {
-						// TODO handle whether the pod is temporarily unevictable or whether
-						// this is an actual error
-						logger.Warning("error evicting pod: %s/%s: %w", pod.Namespace, pod.Name, err)
+						if !isEvictionErrorRecoverable(err) {
+							return errors.Wrapf(err, "error evicting pod: %s/%s", pod.Namespace, pod.Name)
+						}
 					}
-				}(pod)
+					return nil
+				})
 			}
-			wg.Wait()
+			if err := errorGroup.Wait(); err != nil {
+				return err
+			}
+			time.Sleep(n.podEvictionWaitPeriod)
 		}
 	}
 }
@@ -254,4 +277,13 @@ func cordonStatus(desired bool) string {
 		return "cordon"
 	}
 	return "uncordon"
+}
+
+func isEvictionErrorRecoverable(err error) bool {
+	for _, recoverableError := range recoverablePodEvictionErrors {
+		if strings.Contains(err.Error(), recoverableError) {
+			return true
+		}
+	}
+	return false
 }
