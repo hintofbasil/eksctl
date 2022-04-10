@@ -204,7 +204,7 @@ func (d *Evictor) daemonSetFilter(pod corev1.Pod) PodDeleteStatus {
 		if controllerRef.Name == ignoreDaemonSet.Name {
 			switch ignoreDaemonSet.Namespace {
 			case pod.Namespace, metav1.NamespaceAll:
-				return makePodDeleteStatusWithWarning(false, daemonSetWarning)
+				return makePodDeleteStatusSkip()
 			}
 		}
 	}

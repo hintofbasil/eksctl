@@ -3,6 +3,7 @@ package drain
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -151,17 +152,14 @@ func (n *NodeGroupDrainer) Drain() error {
 				go func(i int, node string) {
 					defer sem.Release(1)
 					logger.Debug("starting drain of node %s", node)
-					pending, err := n.evictPods(node)
+					err := n.evictPods(ctx, node)
 					if err != nil {
 						logger.Warning("pod eviction error (%q) on node %s", err, node)
 						time.Sleep(retryDelay)
 						return
 					}
 
-					logger.Debug("%d pods to be evicted from %s", pending, node)
-					if pending == 0 {
-						drainedNodes.Set(node, nil)
-					}
+					drainedNodes.Set(node, nil)
 
 					if n.nodeDrainWaitPeriod > 0 {
 						logger.Debug("waiting for %.0f seconds before draining next node", n.nodeDrainWaitPeriod.Seconds())
@@ -204,29 +202,51 @@ func (n *NodeGroupDrainer) toggleCordon(cordon bool, nodes *corev1.NodeList) {
 			logger.Debug("no need to %s node %q", cordonStatus(cordon), node.Name)
 		}
 	}
-
 }
 
-func (n *NodeGroupDrainer) evictPods(node string) (int, error) {
-	list, errs := n.evictor.GetPodsForEviction(node)
-	if len(errs) > 0 {
-		return 0, fmt.Errorf("errs: %v", errs) // TODO: improve formatting
-	}
-	if list == nil {
-		return 0, nil
-	}
-	if w := list.Warnings(); w != "" {
-		logger.Warning(w)
-	}
-	pods := list.Pods()
-	pending := len(pods)
-	for _, pod := range pods {
-		// TODO: handle API rate limiter error
-		if err := n.evictor.EvictOrDeletePod(pod); err != nil {
-			return pending, errors.Wrapf(err, "error evicting pod: %s/%s", pod.Namespace, pod.Name)
+func (n *NodeGroupDrainer) evictPods(ctx context.Context, node string) error {
+	// Loop until context times out.  We want to continually try to remove pods
+	// from the node as their eviction status changes.
+	previousReportTime := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out (after %s) waiting for node %q to be drained", n.waitTimeout, node)
+		default:
+			list, errs := n.evictor.GetPodsForEviction(node)
+			if len(errs) > 0 {
+				return fmt.Errorf("errs: %v", errs) // TODO: improve formatting
+			}
+			if list == nil {
+				return nil
+			}
+			pods := list.Pods()
+			if w := list.Warnings(); w != "" {
+				logger.Warning(w)
+			}
+			// This log message is important but can be noisy.  It's useful to only
+			// update on a node every minute.
+			if time.Now().Sub(previousReportTime) > time.Minute*1 && len(pods) > 0 {
+				logger.Warning("%d pods are unevictable from node %s")
+				previousReportTime = time.Now()
+			}
+			logger.Debug("%d pods to be evicted from %s", pods, node)
+			var wg sync.WaitGroup
+			for _, pod := range pods {
+				wg.Add(1)
+				go func(pod corev1.Pod) {
+					defer wg.Done()
+					// TODO: handle API rate limiter error
+					if err := n.evictor.EvictOrDeletePod(pod); err != nil {
+						// TODO handle whether the pod is temporarily unevictable or whether
+						// this is an actual error
+						logger.Warning("error evicting pod: %s/%s: %w", pod.Namespace, pod.Name, err)
+					}
+				}(pod)
+			}
+			wg.Wait()
 		}
 	}
-	return pending, nil
 }
 
 func cordonStatus(desired bool) string {
