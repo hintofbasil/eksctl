@@ -123,6 +123,7 @@ func (n *NodeGroupDrainer) Drain() error {
 	parallelLimit := int64(n.parallel)
 	sem := semaphore.NewWeighted(parallelLimit)
 	logger.Info("starting parallel draining, max in-flight of %d", parallelLimit)
+	var evictErr error
 	// loop until all nodes are drained to handle accidental scale-up
 	// or any other changes in the ASG
 	for {
@@ -132,6 +133,9 @@ func (n *NodeGroupDrainer) Drain() error {
 			waitForAllRoutinesToFinish(context.TODO(), sem, parallelLimit)
 			return fmt.Errorf("timed out (after %s) waiting for nodegroup %q to be drained", n.waitTimeout, n.ng.NameString())
 		default:
+			if evictErr != nil {
+				return evictErr
+			}
 			nodes, err := n.clientSet.CoreV1().Nodes().List(context.TODO(), listOptions)
 			if err != nil {
 				return err
@@ -170,7 +174,7 @@ func (n *NodeGroupDrainer) Drain() error {
 					if err != nil {
 						logger.Warning("pod eviction error (%q) on node %s", err, node)
 						time.Sleep(retryDelay)
-						return nil
+						return err
 					}
 
 					drainedNodes.Set(node, nil)
@@ -182,9 +186,9 @@ func (n *NodeGroupDrainer) Drain() error {
 					return nil
 				})
 			}
-			if err := errorGroup.Wait(); err != nil {
-				return err
-			}
+			// Loop one last time to check for a timeout.  We want to handle timeouts
+			// with a consistent error at the top of the loop
+			evictErr = errorGroup.Wait()
 		}
 	}
 }
@@ -252,22 +256,19 @@ func (n *NodeGroupDrainer) evictPods(ctx context.Context, node string) error {
 				previousReportTime = time.Now()
 			}
 			logger.Debug("%d pods to be evicted from %s", pods, node)
-			errorGroup, _ := errgroup.WithContext(ctx)
+			failedEvictions := false
 			for _, pod := range pods {
-				pod := pod
-				errorGroup.Go(func() error {
-					if err := n.evictor.EvictOrDeletePod(pod); err != nil {
-						if !isEvictionErrorRecoverable(err) {
-							return errors.Wrapf(err, "error evicting pod: %s/%s", pod.Namespace, pod.Name)
-						}
+				if err := n.evictor.EvictOrDeletePod(pod); err != nil {
+					if !isEvictionErrorRecoverable(err) {
+						return errors.Wrapf(err, "unrecoverable error evicting pod: %s/%s", pod.Namespace, pod.Name)
 					}
-					return nil
-				})
+					logger.Debug("pod eviction failed recoverably: %q", err)
+					failedEvictions = true
+				}
 			}
-			if err := errorGroup.Wait(); err != nil {
-				return err
+			if failedEvictions {
+				time.Sleep(n.podEvictionWaitPeriod)
 			}
-			time.Sleep(n.podEvictionWaitPeriod)
 		}
 	}
 }
