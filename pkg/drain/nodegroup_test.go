@@ -271,10 +271,6 @@ var _ = Describe("Drain", func() {
 			Expect(fakeEvictor.EvictOrDeletePodCallCount()).To(Equal(2))
 			Expect(fakeEvictor.EvictOrDeletePodArgsForCall(0)).To(Equal(pod))
 			Expect(fakeEvictor.EvictOrDeletePodArgsForCall(1)).To(Equal(pod))
-
-			node, err := fakeClientSet.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
-			Expect(err).NotTo(HaveOccurred())
-			Expect(node.Spec.Unschedulable).To(BeTrue())
 		})
 	})
 
@@ -325,10 +321,69 @@ var _ = Describe("Drain", func() {
 			Expect(fakeEvictor.GetPodsForEvictionCallCount()).To(Equal(1))
 			Expect(fakeEvictor.EvictOrDeletePodCallCount()).To(Equal(1))
 			Expect(fakeEvictor.EvictOrDeletePodArgsForCall(0)).To(Equal(pod))
+		})
+	})
 
-			node, err := fakeClientSet.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+	When("eviction fails recoverably with multiple pods", func() {
+		var pods []corev1.Pod
+		var evictionError error
+
+		BeforeEach(func() {
+			pods = []corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pod-1",
+						Namespace: "ns-1",
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "pod-2",
+						Namespace: "ns-2",
+					},
+				},
+			}
+
+			fakeEvictor.GetPodsForEvictionReturns(&evictor.PodDeleteList{
+				Items: []evictor.PodDelete{
+					{
+						Pod: pods[0],
+						Status: evictor.PodDeleteStatus{
+							Delete: true,
+						},
+					},
+					{
+						Pod: pods[1],
+						Status: evictor.PodDeleteStatus{
+							Delete: true,
+						},
+					},
+				},
+			}, nil)
+
+			evictionError = errors.New("Cannot evict pod as it would violate the pod's disruption budget")
+			fakeEvictor.EvictOrDeletePodReturns(evictionError)
+
+			_, err := fakeClientSet.CoreV1().Nodes().Create(context.TODO(), &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: nodeName,
+				},
+				Spec: corev1.NodeSpec{
+					Unschedulable: false,
+				},
+			}, metav1.CreateOptions{})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(node.Spec.Unschedulable).To(BeTrue())
+		})
+
+		It("it attempts to drain all pods", func() {
+			nodeGroupDrainer := drain.NewNodeGroupDrainer(fakeClientSet, &mockNG, time.Second*10, time.Second, time.Second, time.Second*0, false, false, 1)
+			nodeGroupDrainer.SetDrainer(fakeEvictor)
+
+			_ = nodeGroupDrainer.Drain()
+
+			Expect(fakeEvictor.EvictOrDeletePodCallCount()).To(BeNumerically(">=", 2))
+			Expect(fakeEvictor.EvictOrDeletePodArgsForCall(0)).To(Equal(pods[0]))
+			Expect(fakeEvictor.EvictOrDeletePodArgsForCall(1)).To(Equal(pods[1]))
 		})
 	})
 })
